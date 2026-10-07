@@ -1,0 +1,41 @@
+{
+  "binary": {
+    "linux": {
+      "aarch64": "target/release/cockatiel-user-database",
+      "arm": "target/release/cockatiel-user-database",
+      "x86": "target/release/cockatiel-user-database",
+      "x86_64": "target/release/cockatiel-user-database"
+    },
+    "macos": {
+      "aarch64": "target/release/cockatiel-user-database",
+      "arm": "target/release/cockatiel-user-database",
+      "x86": "target/release/cockatiel-user-database",
+      "x86_64": "target/release/cockatiel-user-database"
+    },
+    "windows": {
+      "aarch64": "target/release/cockatiel-user-database.exe",
+      "arm": "target/release/cockatiel-user-database.exe",
+      "x86": "target/release/cockatiel-user-database.exe",
+      "x86_64": "target/release/cockatiel-user-database.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ],
+  "command_flags": [
+    "run",
+    "--release"
+  ],
+  "kind": "user-db",
+  "launch_command": "cargo",
+  "name": "user-db",
+  "release": {
+    "base_url": "https://github.com/vulbyte/cockatiel_user_database-rs/releases/download",
+    "repo": "vulbyte/cockatiel_user_database-rs",
+    "tag": "v0.1.0"
+  },
+  "root_file": "./src/main.rs",
+  "version": "0.1.0"
+}

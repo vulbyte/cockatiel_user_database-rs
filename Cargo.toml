@@ -13,3 +13,8 @@ prost = "0.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v7", "fast-rng"] }
+
+# Standalone workspace root: user-db is a submodule under the engine's tree,
+# which has its own [workspace]; without this cargo treats it as an undeclared
+# member of the engine workspace and refuses to build.
+[workspace]

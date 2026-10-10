@@ -65,6 +65,25 @@ fn write_env_file(path: &str, pairs: &[(&str, &str)]) {
     }
 }
 
+/// The user's home directory (`$HOME` / `%USERPROFILE%`).
+fn home_dir() -> Option<PathBuf> {
+    let non_empty = |key: &str| env::var_os(key).filter(|v| !v.is_empty());
+    non_empty("HOME")
+        .or_else(|| non_empty("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// The default backup file: `<home>/.cockatiel/backups/user_data_backup.db`,
+/// OUTSIDE the working folder, so a deleted/moved folder cannot take the only
+/// backup with it. Falls back to `./.cockatiel/backups` when home is unknown.
+fn default_user_db_backup_path() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cockatiel")
+        .join("backups")
+        .join("user_data_backup.db")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Secrets + settings follow the pattern: a `.env` file (next to the DB, in
@@ -99,33 +118,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path: PathBuf = env::var("USER_DB_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("user_data.db"));
-    let backup_path: Option<PathBuf> = env::var("USER_DB_BACKUP_PATH")
-        .map(PathBuf::from)
+    // The backup path: an explicit `USER_DB_BACKUP_PATH` (env or `.env`) wins;
+    // otherwise default to the home directory, OUTSIDE the working folder, so a
+    // deleted/moved folder cannot take the only backup with it.
+    let backup_path: PathBuf = env::var("USER_DB_BACKUP_PATH")
         .ok()
-        .filter(|p| !p.as_os_str().is_empty());
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_user_db_backup_path);
 
     let db = Arc::new(UserDatabase::new());
     if let Err(e) = db.initialize(&db_path).await {
         // Local DB unavailable — restore from the backup if one exists.
-        if let Some(bp) = &backup_path {
-            if bp.exists() {
-                eprintln!("[UserDB] local DB unavailable — restoring from backup {}", bp.display());
-                let _ = std::fs::remove_file(format!("{}-wal", db_path.to_string_lossy()));
-                let _ = std::fs::remove_file(format!("{}-shm", db_path.to_string_lossy()));
-                let _ = std::fs::copy(bp, &db_path);
-                db.initialize(&db_path).await?;
-            } else {
-                return Err(e);
-            }
+        if backup_path.exists() {
+            eprintln!("[UserDB] local DB unavailable — restoring from backup {}", backup_path.display());
+            let _ = std::fs::remove_file(format!("{}-wal", db_path.to_string_lossy()));
+            let _ = std::fs::remove_file(format!("{}-shm", db_path.to_string_lossy()));
+            let _ = std::fs::copy(&backup_path, &db_path);
+            db.initialize(&db_path).await?;
         } else {
             return Err(e);
         }
     }
 
-    // Periodic backup to the configured location (if any).
-    if let Some(bp) = &backup_path {
+    // Periodic backup to the configured location (the backup dir is created by
+    // `backup_to` on the first snapshot).
+    {
         let db = Arc::clone(&db);
-        let bp_task = bp.clone();
+        let bp_task = backup_path.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
@@ -136,9 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
-        println!("[UserDB] Backup enabled at {}", bp.display());
-    } else {
-        println!("[UserDB] NO BACKUP SET — a corruption could mean TOTAL DATA LOSS");
+        println!("[UserDB] Backup enabled at {}", backup_path.display());
     }
 
     let bind = env::var("USER_DB_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -549,5 +567,14 @@ mod tests {
         let resp = dispatch(&db, &req).await;
         assert!(!resp.success, "i32::MIN must be rejected, not panic");
         assert!(resp.error.contains("overflow"), "error was: {}", resp.error);
+    }
+
+    #[test]
+    fn default_backup_path_lives_under_home() {
+        let p = default_user_db_backup_path();
+        assert!(
+            p.ends_with(".cockatiel/backups/user_data_backup.db"),
+            "got {p:?}"
+        );
     }
 }

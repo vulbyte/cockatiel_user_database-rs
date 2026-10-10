@@ -328,6 +328,18 @@ impl UserDatabase {
             .await
             .clone()
             .ok_or("User database has no path")?;
+        // The default backup lives in the home directory, whose parent may not
+        // exist yet (0o700 on unix — the snapshot holds user data).
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+        }
         let tmp = format!("{}.tmp", path.to_string_lossy());
         // Hold the connection lock across checkpoint + copy: without it a
         // concurrent writer (or the driver's own checkpoint) can modify the
@@ -350,6 +362,12 @@ impl UserDatabase {
         }
         let _ = std::fs::remove_file(&tmp);
         tokio::fs::copy(&src, &tmp).await.map_err(|e| e.to_string())?;
+        // Keep the snapshot owner-only (it holds user data).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         // rename atomically replaces any existing backup on POSIX; the last good
         // backup must never be removed before the new one is in place.
         tokio::fs::rename(&tmp, path).await.map_err(|e| e.to_string())?;

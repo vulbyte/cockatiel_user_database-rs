@@ -14,6 +14,80 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
+/// TEMPORARY account-merge bridge.
+///
+/// The external `cockatiel-proto` revision is unpublished, so there is no
+/// `MergeUsers` op to call yet. Until there is, the engine tunnels a merge
+/// request through the existing `WriteUserValue` op: it sends this reserved key
+/// (NUL + `__cockatiel_merge__`, a key no user value will ever legitimately
+/// use) with the merge arguments as JSON in the value. The `WriteUserValue`
+/// handler below intercepts the key, performs the merge and never stores it.
+///
+/// MUST stay byte-identical to `MERGE_RESERVED_KEY` in the engine's
+/// `src/queries.rs`.
+const MERGE_RESERVED_KEY: &str = "\u{0}__cockatiel_merge__";
+
+/// TEMPORARY bridge (see [`MERGE_RESERVED_KEY`]): run an account merge tunnelled
+/// through a `WriteUserValue` request. Parses the merge JSON, treats an empty
+/// JSON `primary_uuid7` as the request's own `uuid7` (fallback primary), calls
+/// the atomic `db.merge_users`, and responds with the merged user. The reserved
+/// key is NOT written as a user value.
+async fn dispatch_merge_bridge(
+    db: &Arc<UserDatabase>,
+    wv: &proto::UserValueRequest,
+) -> UserDbResponse {
+    #[derive(serde::Deserialize)]
+    struct MergeArgs {
+        #[serde(default)]
+        primary_uuid7: String,
+        #[serde(default)]
+        secondary_uuid7: String,
+        #[serde(default)]
+        username: String,
+        #[serde(default)]
+        roles_from_secondary: bool,
+    }
+
+    let args: MergeArgs = match serde_json::from_str(&wv.value) {
+        Ok(a) => a,
+        Err(e) => return fail("Merge failed", format!("invalid merge payload: {}", e)),
+    };
+
+    // An empty JSON primary falls back to the request's own uuid7.
+    let primary = if args.primary_uuid7.is_empty() {
+        wv.uuid7.clone()
+    } else {
+        args.primary_uuid7.clone()
+    };
+    if primary.is_empty() {
+        return fail("Merge failed", "primary uuid7 is required");
+    }
+    if args.secondary_uuid7.is_empty() {
+        return fail("Merge failed", "secondary uuid7 is required");
+    }
+
+    let username = if args.username.is_empty() {
+        None
+    } else {
+        Some(args.username.as_str())
+    };
+    match db
+        .merge_users(
+            &primary,
+            &args.secondary_uuid7,
+            username,
+            args.roles_from_secondary,
+        )
+        .await
+    {
+        Ok(()) => {
+            let user = db.get_user_by_uuid(&primary).await.ok().flatten();
+            ok(user, "Users merged".to_string())
+        }
+        Err(e) => fail("Merge failed", e),
+    }
+}
+
 /// Load a KEY=VALUE `.env` file into the process environment (real env wins).
 fn load_env_file(path: &str) {
     let Ok(content) = std::fs::read_to_string(path) else {
@@ -436,6 +510,11 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
             }
         }
         user_db_request::Op::WriteUserValue(wv) => {
+            // TEMPORARY bridge: a reserved key means "merge accounts", not
+            // "write a value" — see `MERGE_RESERVED_KEY`.
+            if wv.key == MERGE_RESERVED_KEY {
+                return dispatch_merge_bridge(db, wv).await;
+            }
             match db.write_user_value(&wv.uuid7, &wv.key, &wv.value).await {
                 Ok(Some(value)) => ok_value(
                     proto::UserValueResult {
@@ -613,6 +692,88 @@ mod tests {
         assert!(
             p.ends_with(".cockatiel/backups/user_data_backup.db"),
             "got {p:?}"
+        );
+    }
+
+    /// TEMPORARY bridge (see `MERGE_RESERVED_KEY`): a WriteUserValue carrying the
+    /// reserved key merges the two users instead of storing a value, while an
+    /// ordinary key still writes normally.
+    #[tokio::test]
+    async fn merge_bridge_merges_and_normal_key_still_writes() {
+        let dir = std::env::temp_dir().join(format!("cok_udb_main_test_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(UserDatabase::new());
+        db.initialize(&dir.join("t.db")).await.unwrap();
+
+        let chan = |id: &str| proto::ChannelRef {
+            platform: "test".into(),
+            channel_id: id.into(),
+            handle: id.into(),
+        };
+        let primary = db
+            .add_user("primary", Some(&chan("cp")))
+            .await
+            .unwrap()
+            .uuid7;
+        let secondary = db
+            .add_user("secondary", Some(&chan("cs")))
+            .await
+            .unwrap()
+            .uuid7;
+
+        let merge_req = UserDbRequest {
+            auth_token: "t".into(),
+            op: Some(user_db_request::Op::WriteUserValue(
+                proto::UserValueRequest {
+                    uuid7: primary.clone(),
+                    key: MERGE_RESERVED_KEY.into(),
+                    value: serde_json::json!({
+                        "primary_uuid7": primary,
+                        "secondary_uuid7": secondary,
+                        "username": "merged",
+                        "roles_from_secondary": false,
+                    })
+                    .to_string(),
+                },
+            )),
+        };
+        let resp = dispatch(&db, &merge_req).await;
+        assert!(resp.success, "merge bridge must succeed: {}", resp.error);
+        assert_eq!(
+            resp.user.as_ref().map(|u| u.username.as_str()),
+            Some("merged")
+        );
+        assert!(
+            db.get_user_by_uuid(&secondary).await.unwrap().is_none(),
+            "the secondary must be gone after the merge"
+        );
+        assert!(
+            db.read_user_value(&primary, MERGE_RESERVED_KEY)
+                .await
+                .unwrap()
+                .is_none(),
+            "the reserved key must never be stored as a value"
+        );
+
+        // An ordinary key still writes through unchanged.
+        let write_req = UserDbRequest {
+            auth_token: "t".into(),
+            op: Some(user_db_request::Op::WriteUserValue(
+                proto::UserValueRequest {
+                    uuid7: primary.clone(),
+                    key: "theme".into(),
+                    value: "dark".into(),
+                },
+            )),
+        };
+        let resp = dispatch(&db, &write_req).await;
+        assert!(resp.success, "normal write must succeed: {}", resp.error);
+        assert_eq!(
+            db.read_user_value(&primary, "theme")
+                .await
+                .unwrap()
+                .unwrap(),
+            "dark"
         );
     }
 }

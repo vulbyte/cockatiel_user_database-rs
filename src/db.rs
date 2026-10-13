@@ -133,12 +133,12 @@ impl Default for RankConfig {
             decay_boundaries_days: vec![365, 730, 1095, 1460],
             decay_weights: vec![1.0, 0.95, 0.9, 0.8],
             w_comm: 1.0,
-            score_divisor: 1000.0,
-            msg_ref: 100.0,
-            w_act: 0.05,
+            score_divisor: 2000.0,
+            msg_ref: 1000.0,
+            w_act: 2.0,
             rep_base: 1.0,
             rep_density_w: 5.0,
-            steepness: 0.02,
+            steepness: 0.034,
         }
     }
 }
@@ -179,10 +179,18 @@ impl RankConfig {
     pub fn sanitize(&mut self) {
         let d = RankConfig::default();
         fn positive(v: f32, fallback: f32) -> f32 {
-            if v.is_finite() && v > 0.0 { v } else { fallback }
+            if v.is_finite() && v > 0.0 {
+                v
+            } else {
+                fallback
+            }
         }
         fn finite(v: f32, fallback: f32) -> f32 {
-            if v.is_finite() { v } else { fallback }
+            if v.is_finite() {
+                v
+            } else {
+                fallback
+            }
         }
         self.score_divisor = positive(self.score_divisor, d.score_divisor);
         self.msg_ref = positive(self.msg_ref, d.msg_ref);
@@ -271,13 +279,20 @@ impl UserDatabase {
         // migration (future spending never reduces it).
         let cols = self.column_names(&conn).await?;
         if !cols.contains(&"total_score".to_string()) {
-            conn.execute("ALTER TABLE users ADD COLUMN total_score INTEGER NOT NULL DEFAULT 0", ())
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN total_score INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await?;
+            conn.execute("UPDATE users SET total_score = score", ())
                 .await?;
-            conn.execute("UPDATE users SET total_score = score", ()).await?;
         }
         if !cols.contains(&"messages_sent".to_string()) {
-            conn.execute("ALTER TABLE users ADD COLUMN messages_sent INTEGER NOT NULL DEFAULT 0", ())
-                .await?;
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN messages_sent INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await?;
         }
 
         {
@@ -302,11 +317,17 @@ impl UserDatabase {
 
     async fn conn(&self) -> Result<turso::Connection, Box<dyn std::error::Error>> {
         let guard = self.local.lock().await;
-        guard.as_ref().cloned().ok_or("User database not initialized".into())
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or("User database not initialized".into())
     }
 
     /// Column names of the `users` table (for idempotent migrations).
-    async fn column_names(&self, conn: &turso::Connection) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    async fn column_names(
+        &self,
+        conn: &turso::Connection,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut rows = conn.query("PRAGMA table_info(users)", ()).await?;
         let mut names = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -316,7 +337,7 @@ impl UserDatabase {
         Ok(names)
     }
 
-/// Create a consistent snapshot of the DB at `path` by checkpointing the WAL
+    /// Create a consistent snapshot of the DB at `path` by checkpointing the WAL
     /// (best-effort) and copying the main file while the connection lock is held
     /// (new queries are briefly serialized behind the copy, but the snapshot can
     /// never be a torn/stale mix), then atomically renaming into place over any
@@ -336,7 +357,8 @@ impl UserDatabase {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
                 }
             }
         }
@@ -361,7 +383,9 @@ impl UserDatabase {
             }
         }
         let _ = std::fs::remove_file(&tmp);
-        tokio::fs::copy(&src, &tmp).await.map_err(|e| e.to_string())?;
+        tokio::fs::copy(&src, &tmp)
+            .await
+            .map_err(|e| e.to_string())?;
         // Keep the snapshot owner-only (it holds user data).
         #[cfg(unix)]
         {
@@ -370,7 +394,9 @@ impl UserDatabase {
         }
         // rename atomically replaces any existing backup on POSIX; the last good
         // backup must never be removed before the new one is in place.
-        tokio::fs::rename(&tmp, path).await.map_err(|e| e.to_string())?;
+        tokio::fs::rename(&tmp, path)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -401,13 +427,20 @@ impl UserDatabase {
                 conn.execute(
                     "INSERT INTO user_channels (user_uuid7, platform, channel_id, handle)
                      VALUES (?1, ?2, ?3, ?4)",
-                    turso::params![uuid7.clone(), ch.platform.clone(), ch.channel_id.clone(), ch.handle.clone()],
+                    turso::params![
+                        uuid7.clone(),
+                        ch.platform.clone(),
+                        ch.channel_id.clone(),
+                        ch.handle.clone()
+                    ],
                 )
                 .await?;
             }
         }
 
-        self.get_user_by_uuid(&uuid7).await?.ok_or("Failed to create user".into())
+        self.get_user_by_uuid(&uuid7)
+            .await?
+            .ok_or("Failed to create user".into())
     }
 
     /// Find a user by (platform, channel_id) or handle. Returns existing user if found.
@@ -420,10 +453,12 @@ impl UserDatabase {
         let conn = self.conn().await?;
 
         // Look up by (platform, channel_id) first.
-        let mut rows = conn.query(
-            "SELECT user_uuid7 FROM user_channels WHERE platform = ?1 AND channel_id = ?2",
-            turso::params![platform, channel_id],
-        ).await?;
+        let mut rows = conn
+            .query(
+                "SELECT user_uuid7 FROM user_channels WHERE platform = ?1 AND channel_id = ?2",
+                turso::params![platform, channel_id],
+            )
+            .await?;
         if let Some(row) = rows.next().await? {
             let uuid7: String = row.get(0)?;
             return self.get_user_by_uuid(&uuid7).await;
@@ -431,10 +466,12 @@ impl UserDatabase {
 
         // Fall back to handle lookup.
         if !handle.is_empty() {
-            let mut rows = conn.query(
-                "SELECT user_uuid7 FROM user_channels WHERE platform = ?1 AND handle = ?2",
-                turso::params![platform, handle],
-            ).await?;
+            let mut rows = conn
+                .query(
+                    "SELECT user_uuid7 FROM user_channels WHERE platform = ?1 AND handle = ?2",
+                    turso::params![platform, handle],
+                )
+                .await?;
             if let Some(row) = rows.next().await? {
                 let uuid7: String = row.get(0)?;
                 return self.get_user_by_uuid(&uuid7).await;
@@ -444,7 +481,10 @@ impl UserDatabase {
         Ok(None)
     }
 
-    pub async fn get_user_by_uuid(&self, uuid7: &str) -> Result<Option<User>, Box<dyn std::error::Error>> {
+    pub async fn get_user_by_uuid(
+        &self,
+        uuid7: &str,
+    ) -> Result<Option<User>, Box<dyn std::error::Error>> {
         let conn = self.conn().await?;
 
         let mut rows = conn.query(
@@ -505,12 +545,17 @@ impl UserDatabase {
         }
     }
 
-    async fn get_channels(&self, uuid7: &str) -> Result<Vec<ChannelRef>, Box<dyn std::error::Error>> {
+    async fn get_channels(
+        &self,
+        uuid7: &str,
+    ) -> Result<Vec<ChannelRef>, Box<dyn std::error::Error>> {
         let conn = self.conn().await?;
-        let mut rows = conn.query(
-            "SELECT platform, channel_id, handle FROM user_channels WHERE user_uuid7 = ?1",
-            turso::params![uuid7],
-        ).await?;
+        let mut rows = conn
+            .query(
+                "SELECT platform, channel_id, handle FROM user_channels WHERE user_uuid7 = ?1",
+                turso::params![uuid7],
+            )
+            .await?;
 
         let mut channels = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -526,7 +571,12 @@ impl UserDatabase {
         Ok(channels)
     }
 
-    async fn channel_exists(&self, uuid7: &str, platform: &str, channel_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    async fn channel_exists(
+        &self,
+        uuid7: &str,
+        platform: &str,
+        channel_id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let conn = self.conn().await?;
         let mut rows = conn.query(
             "SELECT 1 FROM user_channels WHERE user_uuid7 = ?1 AND platform = ?2 AND channel_id = ?3",
@@ -603,7 +653,8 @@ impl UserDatabase {
                 "UPDATE users SET score = score + ?1, total_score = total_score + ?1,
                         commendations = commendations + 1, updated_at = ?3 WHERE uuid7 = ?2",
                 turso::params![delta, uuid7, now],
-            ).await?;
+            )
+            .await?;
         } else {
             // A reprimand is a slap on the wrist: it records the reprimand
             // counter and the history event (which feeds the user's rank) but
@@ -612,7 +663,8 @@ impl UserDatabase {
             conn.execute(
                 "UPDATE users SET reprimands = reprimands + 1, updated_at = ?3 WHERE uuid7 = ?2",
                 turso::params![delta, uuid7, now],
-            ).await?;
+            )
+            .await?;
         }
 
         self.get_user_by_uuid(uuid7).await
@@ -643,7 +695,8 @@ impl UserDatabase {
             conn.execute(
                 "UPDATE users SET score = score + ?1, updated_at = ?2 WHERE uuid7 = ?3",
                 turso::params![delta, now, uuid7],
-            ).await?;
+            )
+            .await?;
         }
 
         self.get_user_by_uuid(uuid7).await
@@ -651,12 +704,16 @@ impl UserDatabase {
 
     /// Increment a user's `messages_sent` counter by 1 (the engine calls this
     /// on every chat message it ingests for that user). A rank factor.
-    pub async fn increment_messages_sent(&self, uuid7: &str) -> Result<Option<User>, Box<dyn std::error::Error>> {
+    pub async fn increment_messages_sent(
+        &self,
+        uuid7: &str,
+    ) -> Result<Option<User>, Box<dyn std::error::Error>> {
         let conn = self.conn().await?;
         conn.execute(
             "UPDATE users SET messages_sent = messages_sent + 1, updated_at = ?2 WHERE uuid7 = ?1",
             turso::params![uuid7, Self::now_ms()],
-        ).await?;
+        )
+        .await?;
         self.get_user_by_uuid(uuid7).await
     }
 
@@ -672,7 +729,11 @@ impl UserDatabase {
     /// separate balance pre-read) is what closes the double-spend window: if
     /// the balance drops between a read and the update, the guarded UPDATE
     /// matches 0 rows and we report failure rather than a phantom success.
-    pub async fn deduct_score(&self, uuid7: &str, amount: i32) -> Result<Option<User>, Box<dyn std::error::Error>> {
+    pub async fn deduct_score(
+        &self,
+        uuid7: &str,
+        amount: i32,
+    ) -> Result<Option<User>, Box<dyn std::error::Error>> {
         if amount <= 0 {
             return self.get_user_by_uuid(uuid7).await;
         }
@@ -803,7 +864,10 @@ impl UserDatabase {
              ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
         };
         let mut rows = conn
-            .query(sql, turso::params![recipient_uuid7, limit, offset, kind_filter])
+            .query(
+                sql,
+                turso::params![recipient_uuid7, limit, offset, kind_filter],
+            )
             .await?;
 
         let mut out = Vec::new();
@@ -839,7 +903,11 @@ impl UserDatabase {
         reason: &str,
     ) -> Result<RatingOutcome, Box<dyn std::error::Error>> {
         let now = Self::now_ms();
-        let kind = if is_commendation { "commend" } else { "reprimand" };
+        let kind = if is_commendation {
+            "commend"
+        } else {
+            "reprimand"
+        };
         let id = uuid::Uuid::now_v7().to_string();
 
         if is_commendation {
@@ -916,13 +984,21 @@ impl UserDatabase {
             return self.get_user_by_uuid(uuid7).await;
         };
         let conn = self.conn().await?;
-        let exists = self.channel_exists(uuid7, &channel.platform, &channel.channel_id).await?;
+        let exists = self
+            .channel_exists(uuid7, &channel.platform, &channel.channel_id)
+            .await?;
         if !exists {
             conn.execute(
                 "INSERT INTO user_channels (user_uuid7, platform, channel_id, handle)
                  VALUES (?1, ?2, ?3, ?4)",
-                turso::params![uuid7, channel.platform.clone(), channel.channel_id.clone(), channel.handle.clone()],
-            ).await?;
+                turso::params![
+                    uuid7,
+                    channel.platform.clone(),
+                    channel.channel_id.clone(),
+                    channel.handle.clone()
+                ],
+            )
+            .await?;
         }
         self.get_user_by_uuid(uuid7).await
     }
@@ -937,7 +1013,8 @@ impl UserDatabase {
         conn.execute(
             "DELETE FROM user_channels WHERE user_uuid7 = ?1 AND platform = ?2 AND channel_id = ?3",
             turso::params![uuid7, platform, channel_id],
-        ).await?;
+        )
+        .await?;
         self.get_user_by_uuid(uuid7).await
     }
 
@@ -950,7 +1027,8 @@ impl UserDatabase {
         conn.execute(
             "UPDATE users SET flags = ?2, updated_at = ?3 WHERE uuid7 = ?1",
             turso::params![uuid7, flags, Self::now_ms()],
-        ).await?;
+        )
+        .await?;
         self.get_user_by_uuid(uuid7).await
     }
 
@@ -992,10 +1070,12 @@ impl UserDatabase {
         }
         // Upsert without ON CONFLICT (unsupported in turso/Limbo).
         let exists = {
-            let mut rows = conn.query(
-                "SELECT 1 FROM user_values WHERE user_uuid7 = ?1 AND key = ?2",
-                turso::params![uuid7, key],
-            ).await?;
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM user_values WHERE user_uuid7 = ?1 AND key = ?2",
+                    turso::params![uuid7, key],
+                )
+                .await?;
             rows.next().await?.is_some()
         };
         if exists {
@@ -1018,10 +1098,12 @@ impl UserDatabase {
         key: &str,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let conn = self.conn().await?;
-        let mut rows = conn.query(
-            "SELECT value FROM user_values WHERE user_uuid7 = ?1 AND key = ?2",
-            turso::params![uuid7, key],
-        ).await?;
+        let mut rows = conn
+            .query(
+                "SELECT value FROM user_values WHERE user_uuid7 = ?1 AND key = ?2",
+                turso::params![uuid7, key],
+            )
+            .await?;
         if let Some(row) = rows.next().await? {
             Ok(Some(row.get::<String>(0)?))
         } else {
@@ -1035,10 +1117,12 @@ impl UserDatabase {
         key: &str,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let conn = self.conn().await?;
-        let changed = conn.execute(
-            "DELETE FROM user_values WHERE user_uuid7 = ?1 AND key = ?2",
-            turso::params![uuid7, key],
-        ).await?;
+        let changed = conn
+            .execute(
+                "DELETE FROM user_values WHERE user_uuid7 = ?1 AND key = ?2",
+                turso::params![uuid7, key],
+            )
+            .await?;
         Ok(changed > 0)
     }
 
@@ -1047,10 +1131,12 @@ impl UserDatabase {
         uuid7: &str,
     ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
         let conn = self.conn().await?;
-        let mut rows = conn.query(
-            "SELECT key, value FROM user_values WHERE user_uuid7 = ?1 ORDER BY key",
-            turso::params![uuid7],
-        ).await?;
+        let mut rows = conn
+            .query(
+                "SELECT key, value FROM user_values WHERE user_uuid7 = ?1 ORDER BY key",
+                turso::params![uuid7],
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             let key: String = row.get(0)?;
@@ -1072,10 +1158,12 @@ impl UserDatabase {
 
         let mut users = Vec::new();
         if platform.is_empty() {
-            let mut rows = conn.query(
-                "SELECT uuid7 FROM users ORDER BY score DESC LIMIT ?1 OFFSET ?2",
-                turso::params![limit, offset],
-            ).await?;
+            let mut rows = conn
+                .query(
+                    "SELECT uuid7 FROM users ORDER BY score DESC LIMIT ?1 OFFSET ?2",
+                    turso::params![limit, offset],
+                )
+                .await?;
             while let Some(row) = rows.next().await? {
                 let uuid7: String = row.get(0)?;
                 if let Some(user) = self.get_user_by_uuid(&uuid7).await? {
@@ -1083,11 +1171,13 @@ impl UserDatabase {
                 }
             }
         } else {
-            let mut rows = conn.query(
-                "SELECT DISTINCT uc.user_uuid7 FROM user_channels uc
+            let mut rows = conn
+                .query(
+                    "SELECT DISTINCT uc.user_uuid7 FROM user_channels uc
                  WHERE uc.platform = ?1 ORDER BY uc.user_uuid7 LIMIT ?2 OFFSET ?3",
-                turso::params![platform, limit, offset],
-            ).await?;
+                    turso::params![platform, limit, offset],
+                )
+                .await?;
             while let Some(row) = rows.next().await? {
                 let uuid7: String = row.get(0)?;
                 if let Some(user) = self.get_user_by_uuid(&uuid7).await? {
@@ -1112,7 +1202,11 @@ mod tests {
     }
 
     async fn add(db: &UserDatabase, username: &str, channel_id: &str) -> String {
-        let chan = ChannelRef { platform: "test".into(), channel_id: channel_id.into(), handle: username.into() };
+        let chan = ChannelRef {
+            platform: "test".into(),
+            channel_id: channel_id.into(),
+            handle: username.into(),
+        };
         db.add_user(username, Some(&chan)).await.unwrap().uuid7
     }
 
@@ -1122,29 +1216,53 @@ mod tests {
         let giver = add(&db, "giver", "cg").await;
         let target = add(&db, "target", "ct").await;
 
-        let first = db.rate_user(&giver, &target, false, "test", "target", "rude").await.unwrap();
+        let first = db
+            .rate_user(&giver, &target, false, "test", "target", "rude")
+            .await
+            .unwrap();
         assert!(first.applied, "first reprimand should apply");
 
         // Second reprimand from the same giver -> denied by the 24h cooldown.
-        let second = db.rate_user(&giver, &target, false, "test", "target", "still rude").await.unwrap();
-        assert!(!second.applied, "second reprimand within 24h must be denied");
+        let second = db
+            .rate_user(&giver, &target, false, "test", "target", "still rude")
+            .await
+            .unwrap();
+        assert!(
+            !second.applied,
+            "second reprimand within 24h must be denied"
+        );
         assert!(second.message.contains("24 hours"));
 
         // A DIFFERENT giver may still reprimand the same target (recipient unlimited).
         let giver2 = add(&db, "giver2", "cg2").await;
-        let other = db.rate_user(&giver2, &target, false, "test", "target", "also rude").await.unwrap();
-        assert!(other.applied, "a different giver may reprimand the same recipient");
+        let other = db
+            .rate_user(&giver2, &target, false, "test", "target", "also rude")
+            .await
+            .unwrap();
+        assert!(
+            other.applied,
+            "a different giver may reprimand the same recipient"
+        );
 
         // Commend is unlimited (same giver, same target, no cooldown).
-        let comm = db.rate_user(&giver, &target, true, "test", "target", "nice").await.unwrap();
+        let comm = db
+            .rate_user(&giver, &target, true, "test", "target", "nice")
+            .await
+            .unwrap();
         assert!(comm.applied, "commend should always apply");
-        let comm2 = db.rate_user(&giver, &target, true, "test", "target", "nice again").await.unwrap();
+        let comm2 = db
+            .rate_user(&giver, &target, true, "test", "target", "nice again")
+            .await
+            .unwrap();
         assert!(comm2.applied, "commend is unlimited");
 
         // Counters reflect it: 2 reprimands (no score change) + 2 commends (each
         // +1 score AND +1 total_score).
         let t = db.get_user_by_uuid(&target).await.unwrap().unwrap();
-        assert_eq!(t.score, 2, "reprimands must not reduce score; 2 commends earn +2");
+        assert_eq!(
+            t.score, 2,
+            "reprimands must not reduce score; 2 commends earn +2"
+        );
         assert_eq!(t.total_score, 2, "commends also bump lifetime total");
         assert_eq!(t.reprimands, 2);
         assert_eq!(t.commendations, 2);
@@ -1162,23 +1280,30 @@ mod tests {
         {
             let db = UserDatabase::new();
             db.initialize(&path).await.unwrap();
-            let chan = ChannelRef { platform: "test".into(), channel_id: "c1".into(), handle: "u".into() };
+            let chan = ChannelRef {
+                platform: "test".into(),
+                channel_id: "c1".into(),
+                handle: "u".into(),
+            };
             let u = db.add_user("u", Some(&chan)).await.unwrap();
             // Give the user some score via the pre-migration path (adjust_score_only).
             db.adjust_score_only(&u.uuid7, 42).await.unwrap();
-            assert_eq!(db.get_user_by_uuid(&u.uuid7).await.unwrap().unwrap().score, 42);
+            assert_eq!(
+                db.get_user_by_uuid(&u.uuid7).await.unwrap().unwrap().score,
+                42
+            );
         }
 
         // "Downgrade" to v1: drop the new columns the way a v1 schema would
         // have them (create a fresh v1 table) — actually simpler: build a v1
         // table directly and insert a row, then let initialize() migrate.
         {
-            let raw = turso::Builder::new_local(path.to_string_lossy().as_ref()).build().await.unwrap();
+            let raw = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
             let conn = raw.connect().unwrap();
-            conn.execute(
-                "DROP TABLE users",
-                (),
-            ).await.unwrap();
+            conn.execute("DROP TABLE users", ()).await.unwrap();
             conn.execute(
                 "CREATE TABLE users (
                     uuid7 TEXT PRIMARY KEY, schema_version INTEGER NOT NULL DEFAULT 1,
@@ -1194,13 +1319,18 @@ mod tests {
                 "INSERT INTO users (uuid7, schema_version, username, score, created_at, updated_at)
                  VALUES ('u1', 1, 'legacy', 77, 1, 1)",
                 turso::params![],
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
         }
 
         let db = UserDatabase::new();
         db.initialize(&path).await.unwrap();
         let u = db.get_user_by_uuid("u1").await.unwrap().unwrap();
-        assert_eq!(u.total_score, 77, "total_score backfilled from existing score");
+        assert_eq!(
+            u.total_score, 77,
+            "total_score backfilled from existing score"
+        );
         assert_eq!(u.messages_sent, 0);
         assert_eq!(u.score, 77);
 
@@ -1232,13 +1362,17 @@ mod tests {
         let target = add(&db, "target", "ct").await;
 
         // A reprimand: counter + history event, NO score change.
-        db.rate_user(&giver, &target, false, "test", "target", "spoilers").await.unwrap();
+        db.rate_user(&giver, &target, false, "test", "target", "spoilers")
+            .await
+            .unwrap();
         let t = db.get_user_by_uuid(&target).await.unwrap().unwrap();
         assert_eq!(t.reprimands, 1);
         assert_eq!(t.score, 0, "reprimand must not reduce score");
 
         // A commendation: score + total + history.
-        db.rate_user(&giver, &target, true, "test", "target", "nice").await.unwrap();
+        db.rate_user(&giver, &target, true, "test", "target", "nice")
+            .await
+            .unwrap();
         let t = db.get_user_by_uuid(&target).await.unwrap().unwrap();
         assert_eq!(t.commendations, 1);
         assert_eq!(t.score, 1);
@@ -1253,7 +1387,11 @@ mod tests {
             "rank must be in [0,1], got {}",
             t.rank
         );
-        assert!(t.rank < 0.5, "low-activity reprimanded user should sit below neutral, got {}", t.rank);
+        assert!(
+            t.rank < 0.5,
+            "low-activity reprimanded user should sit below neutral, got {}",
+            t.rank
+        );
     }
 
     #[tokio::test]
@@ -1271,8 +1409,12 @@ mod tests {
         let db = temp_db().await;
         let giver = add(&db, "giver", "cg").await;
         let target = add(&db, "target", "ct").await;
-        db.rate_user(&giver, &target, false, "test", "target", "spoilers").await.unwrap();
-        db.rate_user(&giver, &target, true, "test", "target", "good").await.unwrap();
+        db.rate_user(&giver, &target, false, "test", "target", "spoilers")
+            .await
+            .unwrap();
+        db.rate_user(&giver, &target, true, "test", "target", "good")
+            .await
+            .unwrap();
 
         let history = db.get_rating_history(&target, "", 100, 0).await.unwrap();
         assert_eq!(history.len(), 2, "history returns everything, no pruning");
@@ -1320,20 +1462,35 @@ mod tests {
         let d = add(&db, "d", "cd").await;
 
         // A is referenced in BOTH directions (giver and recipient).
-        db.rate_user(&a, &b, true, "test", "b", "nice").await.unwrap();
-        db.rate_user(&b, &a, false, "test", "a", "rude").await.unwrap();
+        db.rate_user(&a, &b, true, "test", "b", "nice")
+            .await
+            .unwrap();
+        db.rate_user(&b, &a, false, "test", "a", "rude")
+            .await
+            .unwrap();
         // An unrelated pair whose history must survive the delete.
-        db.rate_user(&c, &d, true, "test", "d", "nice").await.unwrap();
+        db.rate_user(&c, &d, true, "test", "d", "nice")
+            .await
+            .unwrap();
         db.write_user_value(&a, "theme", "dark").await.unwrap();
         assert!(db.read_user_value(&a, "theme").await.unwrap().is_some());
 
-        assert!(db.delete_user(&a).await.unwrap(), "delete reports true for a real user");
+        assert!(
+            db.delete_user(&a).await.unwrap(),
+            "delete reports true for a real user"
+        );
         assert!(db.get_user_by_uuid(&a).await.unwrap().is_none());
 
         let conn = db.conn().await.unwrap();
         for (table, sql) in [
-            ("user_channels", "SELECT COUNT(*) FROM user_channels WHERE user_uuid7 = ?1"),
-            ("user_values", "SELECT COUNT(*) FROM user_values WHERE user_uuid7 = ?1"),
+            (
+                "user_channels",
+                "SELECT COUNT(*) FROM user_channels WHERE user_uuid7 = ?1",
+            ),
+            (
+                "user_values",
+                "SELECT COUNT(*) FROM user_values WHERE user_uuid7 = ?1",
+            ),
         ] {
             let mut rows = conn.query(sql, turso::params![a.clone()]).await.unwrap();
             let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
@@ -1341,7 +1498,10 @@ mod tests {
         }
 
         // Both history rows referencing A are gone; the C->D row survives.
-        let mut rows = conn.query("SELECT giver_uuid7 FROM rating_history", ()).await.unwrap();
+        let mut rows = conn
+            .query("SELECT giver_uuid7 FROM rating_history", ())
+            .await
+            .unwrap();
         let mut givers = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
             givers.push(row.get::<String>(0).unwrap());
@@ -1396,7 +1556,10 @@ mod tests {
 
         let t = db.get_user_by_uuid(&target).await.unwrap().unwrap();
         assert_eq!(t.reprimands, 1);
-        let history = db.get_rating_history(&target, "reprimand", 100, 0).await.unwrap();
+        let history = db
+            .get_rating_history(&target, "reprimand", 100, 0)
+            .await
+            .unwrap();
         assert_eq!(history.len(), 1, "only one reprimand history row may exist");
     }
 
@@ -1442,8 +1605,68 @@ mod tests {
         db.reload_config(&dir);
         let rank = db.compute_rank("u", 0, 12345, 3, 2, 7, 0).await;
         assert!(rank.is_finite(), "rank must be finite, got {rank}");
-        assert!((0.0..=1.0).contains(&rank), "rank must be in [0,1], got {rank}");
+        assert!(
+            (0.0..=1.0).contains(&rank),
+            "rank must be in [0,1], got {rank}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rank with no rating history (synthetic total_score + messages only).
+    async fn synthetic_rank(db: &UserDatabase, total_score: i32, messages_sent: i32) -> f32 {
+        db.compute_rank("synthetic", 0, total_score, 0, 0, messages_sent, 0)
+            .await
+    }
+
+    #[tokio::test]
+    async fn rank_economy_hits_tier_targets() {
+        let db = temp_db().await;
+
+        // A brand-new user (0 messages, 0 score) sits at neutral ~0.5.
+        let fresh = synthetic_rank(&db, 0, 0).await;
+        assert!(
+            (fresh - 0.5).abs() < 0.01,
+            "0 msgs should be neutral ~0.5, got {fresh}"
+        );
+
+        // Gold target: ~20 pts/message → ~20 000 pts at 1000 messages ≈ 0.60.
+        let gold = synthetic_rank(&db, 20_000, 1_000).await;
+        assert!(
+            (0.58..=0.62).contains(&gold),
+            "20k pts/1000 msgs should be ~0.60 (0.58-0.62), got {gold}"
+        );
+
+        // Upper target: ~45 000 pts at 2300 messages ≈ 0.70.
+        let platinum = synthetic_rank(&db, 45_000, 2_300).await;
+        assert!(
+            (0.68..=0.72).contains(&platinum),
+            "45k pts/2300 msgs should be ~0.70, got {platinum}"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_bonus_is_no_longer_capped_at_100_messages() {
+        let db = temp_db().await;
+
+        // With the old msg_ref=100 both counts saturated; now 1000 msgs must
+        // earn a strictly larger activity bonus than 100 msgs.
+        let at_100 = synthetic_rank(&db, 0, 100).await;
+        let at_1000 = synthetic_rank(&db, 0, 1_000).await;
+        assert!(
+            at_1000 > at_100,
+            "1000 msgs should outrank 100 msgs, got {at_1000} vs {at_100}"
+        );
+        assert!(
+            at_1000 - at_100 > 0.005,
+            "the 100 → 1000 msg step should be a meaningful gain, got {at_1000} - {at_100}"
+        );
+
+        // It still saturates at msg_ref (1000): 1000 and 5000 msgs are equal.
+        let at_5000 = synthetic_rank(&db, 0, 5_000).await;
+        assert!(
+            (at_5000 - at_1000).abs() < 1e-6,
+            "activity must saturate at msg_ref=1000, got {at_5000} vs {at_1000}"
+        );
     }
 }

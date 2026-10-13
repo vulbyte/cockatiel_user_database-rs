@@ -16,7 +16,9 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 /// Load a KEY=VALUE `.env` file into the process environment (real env wins).
 fn load_env_file(path: &str) {
-    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -101,7 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     );
 
-    let port: u16 = env::var("USER_DB_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9736);
+    let port: u16 = env::var("USER_DB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9736);
     let token = match env::var("USER_DB_TOKEN") {
         Ok(t) if !t.trim().is_empty() => t,
         _ => {
@@ -109,9 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // so the operator (and the supervisor on next launch) can use it.
             let generated = uuid::Uuid::new_v4().to_string();
             write_env_file(".env", &[("USER_DB_TOKEN", &generated)]);
-            eprintln!(
-                "[UserDB] No USER_DB_TOKEN configured — generated one and wrote it to .env"
-            );
+            eprintln!("[UserDB] No USER_DB_TOKEN configured — generated one and wrote it to .env");
             generated
         }
     };
@@ -131,7 +134,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = db.initialize(&db_path).await {
         // Local DB unavailable — restore from the backup if one exists.
         if backup_path.exists() {
-            eprintln!("[UserDB] local DB unavailable — restoring from backup {}", backup_path.display());
+            eprintln!(
+                "[UserDB] local DB unavailable — restoring from backup {}",
+                backup_path.display()
+            );
             let _ = std::fs::remove_file(format!("{}-wal", db_path.to_string_lossy()));
             let _ = std::fs::remove_file(format!("{}-shm", db_path.to_string_lossy()));
             let _ = std::fs::copy(&backup_path, &db_path);
@@ -161,7 +167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind = env::var("USER_DB_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     let listener = TcpListener::bind(format!("{}:{}", bind, port)).await?;
-    println!("[UserDB] Listening on {}:{} (engine-only access)", bind, port);
+    println!(
+        "[UserDB] Listening on {}:{} (engine-only access)",
+        bind, port
+    );
 
     // This db's own config.json is its single source of truth for tunable
     // numbers (the rank decay, score divisor, etc.) — it never reads another
@@ -234,7 +243,10 @@ async fn handle_connection(
             Ok(resp) => resp,
             Err(join) => {
                 eprintln!("[UserDB] request panicked: {}", join);
-                fail("Query panicked", format!("a database operation panicked (unsupported SQL?): {}", join))
+                fail(
+                    "Query panicked",
+                    format!("a database operation panicked (unsupported SQL?): {}", join),
+                )
             }
         };
         send_response(&mut write, response).await?;
@@ -260,7 +272,10 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
                     .ok()
                     .flatten()
                 {
-                    return ok(Some(existing), "User already exists; returning existing".to_string());
+                    return ok(
+                        Some(existing),
+                        "User already exists; returning existing".to_string(),
+                    );
                 }
             }
             match db.add_user(&add.username, channel).await {
@@ -289,13 +304,11 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
                 Err(e) => fail("Delete failed", e.to_string()),
             }
         }
-        user_db_request::Op::AddScore(s) => {
-            match db.adjust_score(&s.uuid7, s.delta, true).await {
-                Ok(Some(user)) => ok(Some(user), "Score added".to_string()),
-                Ok(None) => fail("Score add failed", "User not found"),
-                Err(e) => fail("Score add failed", e.to_string()),
-            }
-        }
+        user_db_request::Op::AddScore(s) => match db.adjust_score(&s.uuid7, s.delta, true).await {
+            Ok(Some(user)) => ok(Some(user), "Score added".to_string()),
+            Ok(None) => fail("Score add failed", "User not found"),
+            Err(e) => fail("Score add failed", e.to_string()),
+        },
         user_db_request::Op::RemoveScore(s) => {
             // NOTE: `RemoveScore` currently routes through `adjust_score(...,
             // is_commendation = false)`, which only bumps the reprimand counter
@@ -305,7 +318,10 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
             // `checked_neg` (not `-s.delta`) so `i32::MIN`, which has no positive
             // counterpart, is rejected instead of panicking/wrapping.
             let Some(delta) = s.delta.checked_neg() else {
-                return fail("Score remove failed", "delta overflow: i32::MIN cannot be negated");
+                return fail(
+                    "Score remove failed",
+                    "delta overflow: i32::MIN cannot be negated",
+                );
             };
             match db.adjust_score(&s.uuid7, delta, false).await {
                 Ok(Some(user)) => ok(Some(user), "Score removed".to_string()),
@@ -322,7 +338,14 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
         }
         user_db_request::Op::RateUser(r) => {
             match db
-                .rate_user(&r.giver_uuid7, &r.recipient_uuid7, r.is_commendation, &r.platform, &r.handle, &r.reason)
+                .rate_user(
+                    &r.giver_uuid7,
+                    &r.recipient_uuid7,
+                    r.is_commendation,
+                    &r.platform,
+                    &r.handle,
+                    &r.reason,
+                )
                 .await
             {
                 Ok(outcome) if outcome.applied => ok(None, outcome.message),
@@ -344,7 +367,10 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
             }
         }
         user_db_request::Op::RemoveChannel(rc) => {
-            match db.remove_channel(&rc.uuid7, &rc.platform, &rc.channel_id).await {
+            match db
+                .remove_channel(&rc.uuid7, &rc.platform, &rc.channel_id)
+                .await
+            {
                 Ok(Some(user)) => ok(Some(user), "Channel removed".to_string()),
                 Ok(None) => fail("Remove channel failed", "User not found"),
                 Err(e) => fail("Remove channel failed", e.to_string()),
@@ -370,13 +396,11 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
                 Err(e) => fail("List users failed", e.to_string()),
             }
         }
-        user_db_request::Op::UpdateFlags(uf) => {
-            match db.update_flags(&uf.uuid7, &uf.flags).await {
-                Ok(Some(user)) => ok(Some(user), "Flags updated".to_string()),
-                Ok(None) => fail("Update flags failed", "User not found"),
-                Err(e) => fail("Update flags failed", e.to_string()),
-            }
-        }
+        user_db_request::Op::UpdateFlags(uf) => match db.update_flags(&uf.uuid7, &uf.flags).await {
+            Ok(Some(user)) => ok(Some(user), "Flags updated".to_string()),
+            Ok(None) => fail("Update flags failed", "User not found"),
+            Err(e) => fail("Update flags failed", e.to_string()),
+        },
         user_db_request::Op::SetRoles(sr) => {
             // Only owner/admin actors may change roles.
             let role = sr.actor_role.to_lowercase();
@@ -384,7 +408,13 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
                 return fail("Permission denied", "Only owner/admin may change roles");
             }
             match db
-                .set_roles(&sr.uuid7, sr.is_sponsor, sr.is_moderator, sr.is_admin, sr.is_owner)
+                .set_roles(
+                    &sr.uuid7,
+                    sr.is_sponsor,
+                    sr.is_moderator,
+                    sr.is_admin,
+                    sr.is_owner,
+                )
                 .await
             {
                 Ok(Some(user)) => ok(Some(user), "Roles updated".to_string()),
@@ -394,20 +424,26 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
         }
         user_db_request::Op::ReadUserValue(rv) => {
             match db.read_user_value(&rv.uuid7, &rv.key).await {
-                Ok(Some(value)) => ok_value(proto::UserValueResult {
-                    key: rv.key.clone(),
-                    value,
-                }, "Value read".to_string()),
+                Ok(Some(value)) => ok_value(
+                    proto::UserValueResult {
+                        key: rv.key.clone(),
+                        value,
+                    },
+                    "Value read".to_string(),
+                ),
                 Ok(None) => fail("Read value failed", "Value or user not found"),
                 Err(e) => fail("Read value failed", e.to_string()),
             }
         }
         user_db_request::Op::WriteUserValue(wv) => {
             match db.write_user_value(&wv.uuid7, &wv.key, &wv.value).await {
-                Ok(Some(value)) => ok_value(proto::UserValueResult {
-                    key: wv.key.clone(),
-                    value,
-                }, "Value written".to_string()),
+                Ok(Some(value)) => ok_value(
+                    proto::UserValueResult {
+                        key: wv.key.clone(),
+                        value,
+                    },
+                    "Value written".to_string(),
+                ),
                 Ok(None) => fail("Write value failed", "User not found"),
                 Err(e) => fail("Write value failed", e.to_string()),
             }
@@ -419,27 +455,26 @@ async fn dispatch(db: &Arc<UserDatabase>, request: &UserDbRequest) -> UserDbResp
                 Err(e) => fail("Delete value failed", e.to_string()),
             }
         }
-        user_db_request::Op::ListUserValues(lv) => {
-            match db.list_user_values(&lv.uuid7).await {
-                Ok(entries) => {
-                    let results = entries.into_iter().map(|(k, v)| proto::UserValueResult {
-                        key: k,
-                        value: v,
-                    }).collect();
-                    ok_values(results, "Values listed".to_string())
-                }
-                Err(e) => fail("List values failed", e.to_string()),
+        user_db_request::Op::ListUserValues(lv) => match db.list_user_values(&lv.uuid7).await {
+            Ok(entries) => {
+                let results = entries
+                    .into_iter()
+                    .map(|(k, v)| proto::UserValueResult { key: k, value: v })
+                    .collect();
+                ok_values(results, "Values listed".to_string())
             }
-        }
-        user_db_request::Op::DeductScore(d) => {
-            match db.deduct_score(&d.uuid7, d.amount).await {
-                Ok(Some(user)) => ok(Some(user), "Score deducted".to_string()),
-                Ok(None) => fail("Deduct failed", "User not found or insufficient score"),
-                Err(e) => fail("Deduct failed", e.to_string()),
-            }
-        }
+            Err(e) => fail("List values failed", e.to_string()),
+        },
+        user_db_request::Op::DeductScore(d) => match db.deduct_score(&d.uuid7, d.amount).await {
+            Ok(Some(user)) => ok(Some(user), "Score deducted".to_string()),
+            Ok(None) => fail("Deduct failed", "User not found or insufficient score"),
+            Err(e) => fail("Deduct failed", e.to_string()),
+        },
         user_db_request::Op::GetRatingHistory(g) => {
-            match db.get_rating_history(&g.uuid7, &g.kind, g.limit, g.offset).await {
+            match db
+                .get_rating_history(&g.uuid7, &g.kind, g.limit, g.offset)
+                .await
+            {
                 Ok(entries) => ok_history(entries, "Rating history listed".to_string()),
                 Err(e) => fail("Get rating history failed", e.to_string()),
             }
@@ -512,7 +547,10 @@ fn ok_values(values: Vec<proto::UserValueResult>, message: impl Into<String>) ->
     }
 }
 
-fn ok_history(entries: Vec<proto::RatingHistoryEntry>, message: impl Into<String>) -> UserDbResponse {
+fn ok_history(
+    entries: Vec<proto::RatingHistoryEntry>,
+    message: impl Into<String>,
+) -> UserDbResponse {
     UserDbResponse {
         success: true,
         error: String::new(),

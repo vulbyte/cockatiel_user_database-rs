@@ -637,6 +637,236 @@ impl UserDatabase {
         }
     }
 
+    /// Merge the `secondary` account into `primary`, atomically.
+    ///
+    /// Everything the secondary owns is reassigned to the primary: channels
+    /// (deduped on the `(user_uuid7, platform, channel_id)` primary key),
+    /// key-value entries (the primary's existing value wins on a key
+    /// collision), all rating history (as giver AND as recipient), and the
+    /// score/counter totals (summed). Optionally the primary's username is
+    /// overwritten and the secondary's roles copied over. The secondary row is
+    /// then deleted. Runs inside one IMMEDIATE transaction under `write_lock`,
+    /// so a failure can never leave a half-merged account behind.
+    ///
+    /// Takes plain strings/bools (no proto type) so it can be wired to a proto
+    /// handler later without depending on the compiled proto revision.
+    #[allow(dead_code)]
+    pub async fn merge_users(
+        &self,
+        primary_uuid7: &str,
+        secondary_uuid7: &str,
+        username: Option<&str>,
+        roles_from_secondary: bool,
+    ) -> Result<(), String> {
+        if primary_uuid7 == secondary_uuid7 {
+            return Err("cannot merge a user into itself".to_string());
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut conn = self.conn().await.map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(turso::transaction::TransactionBehavior::Immediate)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let result: Result<(), String> = async {
+            // 1. Load both users (both must exist).
+            let mut rows = tx
+                .query(
+                    "SELECT username, is_sponsor, is_moderator, is_admin, is_owner \
+                     FROM users WHERE uuid7 = ?1",
+                    turso::params![primary_uuid7],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let Some(row) = rows.next().await.map_err(|e| e.to_string())? else {
+                return Err("primary user not found".to_string());
+            };
+            let primary_username: String = row.get(0).map_err(|e| e.to_string())?;
+            let p_sponsor: i64 = row.get(1).map_err(|e| e.to_string())?;
+            let p_mod: i64 = row.get(2).map_err(|e| e.to_string())?;
+            let p_admin: i64 = row.get(3).map_err(|e| e.to_string())?;
+            let p_owner: i64 = row.get(4).map_err(|e| e.to_string())?;
+
+            let mut rows = tx
+                .query(
+                    "SELECT is_sponsor, is_moderator, is_admin, is_owner, score, \
+                     total_score, commendations, reprimands, messages_sent \
+                     FROM users WHERE uuid7 = ?1",
+                    turso::params![secondary_uuid7],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let Some(row) = rows.next().await.map_err(|e| e.to_string())? else {
+                return Err("secondary user not found".to_string());
+            };
+            let s_sponsor: i64 = row.get(0).map_err(|e| e.to_string())?;
+            let s_mod: i64 = row.get(1).map_err(|e| e.to_string())?;
+            let s_admin: i64 = row.get(2).map_err(|e| e.to_string())?;
+            let s_owner: i64 = row.get(3).map_err(|e| e.to_string())?;
+            let s_score: i64 = row.get(4).map_err(|e| e.to_string())?;
+            let s_total: i64 = row.get(5).map_err(|e| e.to_string())?;
+            let s_comm: i64 = row.get(6).map_err(|e| e.to_string())?;
+            let s_rep: i64 = row.get(7).map_err(|e| e.to_string())?;
+            let s_msg: i64 = row.get(8).map_err(|e| e.to_string())?;
+
+            // 2. Move channels. turso rejects INSERT OR IGNORE / ON CONFLICT, so
+            //    skip any (platform, channel_id) the primary already has before
+            //    inserting (the PK is (user_uuid7, platform, channel_id)).
+            let mut rows = tx
+                .query(
+                    "SELECT platform, channel_id, handle FROM user_channels WHERE user_uuid7 = ?1",
+                    turso::params![secondary_uuid7],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut channels: Vec<(String, String, String)> = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
+                let handle: Option<String> = row.get(2).map_err(|e| e.to_string())?;
+                channels.push((
+                    row.get(0).map_err(|e| e.to_string())?,
+                    row.get(1).map_err(|e| e.to_string())?,
+                    handle.unwrap_or_default(),
+                ));
+            }
+            for (platform, channel_id, handle) in channels {
+                let mut existing = tx
+                    .query(
+                        "SELECT 1 FROM user_channels \
+                         WHERE user_uuid7 = ?1 AND platform = ?2 AND channel_id = ?3",
+                        turso::params![primary_uuid7, platform.clone(), channel_id.clone()],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if existing.next().await.map_err(|e| e.to_string())?.is_none() {
+                    tx.execute(
+                        "INSERT INTO user_channels (user_uuid7, platform, channel_id, handle) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        turso::params![primary_uuid7, platform, channel_id, handle],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM user_channels WHERE user_uuid7 = ?1",
+                turso::params![secondary_uuid7],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            // 3. Move user_values; the primary's value wins on a key collision.
+            let mut rows = tx
+                .query(
+                    "SELECT key, value, updated_at FROM user_values WHERE user_uuid7 = ?1",
+                    turso::params![secondary_uuid7],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut values: Vec<(String, String, i64)> = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
+                values.push((
+                    row.get(0).map_err(|e| e.to_string())?,
+                    row.get(1).map_err(|e| e.to_string())?,
+                    row.get(2).map_err(|e| e.to_string())?,
+                ));
+            }
+            for (key, value, updated_at) in values {
+                let mut existing = tx
+                    .query(
+                        "SELECT 1 FROM user_values WHERE user_uuid7 = ?1 AND key = ?2",
+                        turso::params![primary_uuid7, key.clone()],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if existing.next().await.map_err(|e| e.to_string())?.is_none() {
+                    tx.execute(
+                        "INSERT INTO user_values (user_uuid7, key, value, updated_at) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        turso::params![primary_uuid7, key, value, updated_at],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM user_values WHERE user_uuid7 = ?1",
+                turso::params![secondary_uuid7],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            // 4. Reassign rating history in both directions.
+            tx.execute(
+                "UPDATE rating_history SET recipient_uuid7 = ?1 WHERE recipient_uuid7 = ?2",
+                turso::params![primary_uuid7, secondary_uuid7],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE rating_history SET giver_uuid7 = ?1 WHERE giver_uuid7 = ?2",
+                turso::params![primary_uuid7, secondary_uuid7],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            // 5-7. Sum counters, optionally rename and copy roles, in one write.
+            let final_username = match username {
+                Some(u) if !u.is_empty() => u.to_string(),
+                _ => primary_username,
+            };
+            let (sponsor, moderator, admin, owner) = if roles_from_secondary {
+                (s_sponsor, s_mod, s_admin, s_owner)
+            } else {
+                (p_sponsor, p_mod, p_admin, p_owner)
+            };
+            tx.execute(
+                "UPDATE users SET username = ?1, is_sponsor = ?2, is_moderator = ?3, \
+                 is_admin = ?4, is_owner = ?5, score = score + ?6, \
+                 total_score = total_score + ?7, commendations = commendations + ?8, \
+                 reprimands = reprimands + ?9, messages_sent = messages_sent + ?10, \
+                 updated_at = ?11 WHERE uuid7 = ?12",
+                turso::params![
+                    final_username,
+                    sponsor,
+                    moderator,
+                    admin,
+                    owner,
+                    s_score,
+                    s_total,
+                    s_comm,
+                    s_rep,
+                    s_msg,
+                    Self::now_ms(),
+                    primary_uuid7,
+                ],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            // 8. Drop the now-empty secondary row.
+            tx.execute(
+                "DELETE FROM users WHERE uuid7 = ?1",
+                turso::params![secondary_uuid7],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                tx.commit().await.map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
     pub async fn adjust_score(
         &self,
         uuid7: &str,
@@ -1507,6 +1737,180 @@ mod tests {
             givers.push(row.get::<String>(0).unwrap());
         }
         assert_eq!(givers, vec![c], "only the unrelated history row may remain");
+    }
+
+    #[tokio::test]
+    async fn merge_users_reassigns_everything_and_sums_counters() {
+        let db = temp_db().await;
+        let primary = add(&db, "primary", "cp").await;
+        let secondary = add(&db, "secondary", "cs").await;
+        let other = add(&db, "other", "co").await;
+
+        // A channel both accounts share (must survive exactly once) plus one
+        // only the secondary has (must move over).
+        let shared = ChannelRef {
+            platform: "test".into(),
+            channel_id: "shared".into(),
+            handle: "shared".into(),
+        };
+        db.add_channel(&primary, Some(&shared)).await.unwrap();
+        db.add_channel(&secondary, Some(&shared)).await.unwrap();
+        let secondary_only = ChannelRef {
+            platform: "test".into(),
+            channel_id: "cs2".into(),
+            handle: "secondary2".into(),
+        };
+        db.add_channel(&secondary, Some(&secondary_only))
+            .await
+            .unwrap();
+
+        // user_values: one colliding key (primary wins) + one secondary-only.
+        db.write_user_value(&primary, "shared", "primary-wins")
+            .await
+            .unwrap();
+        db.write_user_value(&primary, "primary_only", "p")
+            .await
+            .unwrap();
+        db.write_user_value(&secondary, "shared", "secondary-loses")
+            .await
+            .unwrap();
+        db.write_user_value(&secondary, "secondary_only", "s")
+            .await
+            .unwrap();
+
+        // rating_history: the secondary as recipient AND as giver.
+        db.rate_user(&other, &secondary, true, "test", "secondary", "nice")
+            .await
+            .unwrap();
+        db.rate_user(&secondary, &other, true, "test", "other", "nice")
+            .await
+            .unwrap();
+        db.rate_user(&other, &secondary, false, "test", "secondary", "rude")
+            .await
+            .unwrap();
+
+        // Distinct counters, all via the public API.
+        db.adjust_score_only(&primary, 10).await.unwrap();
+        db.adjust_score_only(&secondary, 5).await.unwrap();
+        db.increment_messages_sent(&primary).await.unwrap();
+        db.increment_messages_sent(&secondary).await.unwrap();
+        db.increment_messages_sent(&secondary).await.unwrap();
+        db.set_roles(&secondary, true, true, false, false)
+            .await
+            .unwrap();
+        db.set_roles(&primary, false, false, false, false)
+            .await
+            .unwrap();
+
+        let before_p = db.get_user_by_uuid(&primary).await.unwrap().unwrap();
+        let before_s = db.get_user_by_uuid(&secondary).await.unwrap().unwrap();
+
+        db.merge_users(&primary, &secondary, Some("merged"), true)
+            .await
+            .unwrap();
+
+        let after = db.get_user_by_uuid(&primary).await.unwrap().unwrap();
+        assert_eq!(after.score, before_p.score + before_s.score);
+        assert_eq!(
+            after.total_score,
+            before_p.total_score + before_s.total_score
+        );
+        assert_eq!(
+            after.commendations,
+            before_p.commendations + before_s.commendations
+        );
+        assert_eq!(after.reprimands, before_p.reprimands + before_s.reprimands);
+        assert_eq!(
+            after.messages_sent,
+            before_p.messages_sent + before_s.messages_sent
+        );
+        assert_eq!(after.username, "merged");
+        assert!(
+            after.is_sponsor && after.is_moderator,
+            "roles copied from secondary"
+        );
+        assert!(!after.is_admin && !after.is_owner);
+
+        // Channels: the union, deduped on (platform, channel_id).
+        let mut channel_ids: Vec<String> = after
+            .channels
+            .iter()
+            .map(|c| c.channel_id.clone())
+            .collect();
+        channel_ids.sort();
+        assert_eq!(
+            channel_ids,
+            vec![
+                "cp".to_string(),
+                "cs".to_string(),
+                "cs2".to_string(),
+                "shared".to_string()
+            ]
+        );
+
+        // Values: primary wins the collision, secondary-only moves over.
+        assert_eq!(
+            db.read_user_value(&primary, "shared")
+                .await
+                .unwrap()
+                .unwrap(),
+            "primary-wins"
+        );
+        assert_eq!(
+            db.read_user_value(&primary, "primary_only")
+                .await
+                .unwrap()
+                .unwrap(),
+            "p"
+        );
+        assert_eq!(
+            db.read_user_value(&primary, "secondary_only")
+                .await
+                .unwrap()
+                .unwrap(),
+            "s"
+        );
+        assert!(db.list_user_values(&secondary).await.unwrap().is_empty());
+
+        // ALL rating_history rows now point at the primary; none at secondary.
+        let conn = db.conn().await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT giver_uuid7, recipient_uuid7 FROM rating_history",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut total = 0;
+        while let Some(row) = rows.next().await.unwrap() {
+            let giver: String = row.get(0).unwrap();
+            let recipient: String = row.get(1).unwrap();
+            assert_ne!(giver, secondary, "a history row still names the secondary");
+            assert_ne!(
+                recipient, secondary,
+                "a history row still names the secondary"
+            );
+            total += 1;
+        }
+        assert_eq!(total, 3, "all three history rows must survive the merge");
+
+        // The secondary row is gone.
+        assert!(db.get_user_by_uuid(&secondary).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn merge_users_errors_on_self_or_missing() {
+        let db = temp_db().await;
+        let a = add(&db, "a", "ca").await;
+        let b = add(&db, "b", "cb").await;
+
+        assert!(db.merge_users(&a, &a, None, false).await.is_err());
+        assert!(db.merge_users("missing", &b, None, false).await.is_err());
+        assert!(db.merge_users(&a, "missing", None, false).await.is_err());
+
+        // A failed merge must leave both real users untouched.
+        assert!(db.get_user_by_uuid(&a).await.unwrap().is_some());
+        assert!(db.get_user_by_uuid(&b).await.unwrap().is_some());
     }
 
     #[tokio::test]
